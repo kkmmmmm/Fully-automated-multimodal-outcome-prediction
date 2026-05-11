@@ -1,0 +1,837 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+r"""
+run_ich_grid.py
+（個別スライス → 5×5グリッド合成版 / mRS予測専用・マルチモーダル版）
+
+- results/ICH_slices_all_mscs/<患者ID>/ 内のバラ画像を読み込み、
+  プログラム内で5×5グリッド（スライス番号ラベル付き）に合成してAPIに送信。
+- patients data.xlsx の臨床データ（D列以降）をプロンプトに統合（マルチモーダル推論）。
+  - 単回入院: フォルダ名 = 患者ID（7桁ゼロパディング）
+  - 複数入院: フォルダ名 = 患者ID_YYYYMMDD → 入院日〜退院日でExcel行を特定
+- 退院時mRS3以上・4以上・5以上・6（院内死亡）の予測確率を出力。
+- 病院ベースレート（事前確率）をプロンプトに組み込み確率較正を改善。
+"""
+
+import io
+import json
+import os
+import re
+import sys
+import time
+import base64
+import csv
+from datetime import datetime
+from pathlib import Path
+from typing import List, Dict, Optional, Tuple
+
+import pandas as pd
+import httpx
+from dotenv import load_dotenv
+from openai import AzureOpenAI
+from PIL import Image, ImageDraw, ImageFont
+
+# ───────────── ユーザ設定 ───────────── #
+DESKTOP_DIR: Path       = Path(r"\\FRedirect\desktop$\mk07637")
+OUTPUT_FILE_PREFIX: str = "ich_mrs_results_imp"   # → ich_mrs_results_imp1.xlsx … imp5.xlsx
+OUTPUT_FILE_NAME: str   = "ich_mrs_results.xlsx"  # 後方互換（単体実行時のみ使用）
+OUTPUT_CSV_NAME: str    = "ich_mrs_results.csv"
+MAX_RETRIES: int        = 6
+WAIT_SEC: int           = 2
+RATE_LIMIT_WAIT_SEC: int = 60   # 429/no_capacity 時の初回待機秒数（指数バックオフ）
+FALLBACK_TEXT: str      = "I do not know"
+MAX_PROB_RETRIES: int   = 20    # 確率が全部揃うまでの最大リトライ回数（欠損なし保証）
+
+# 多重補完（mice）設定
+N_IMPUTATIONS: int      = 5   # 補完データセット数（mice の m と対応）
+# デスクトップに置く補完済みデータファイル名プレフィックス
+# → patients_data_imp1.xlsx … patients_data_imp5.xlsx を自動生成
+IMPUTED_DATA_PREFIX: str = "patients_data_imp"
+
+# reasoning を固定（フォールバックしない）
+STRICT_REASONING: bool  = True
+REASONING_EFFORT: str   = "low"   # "low" / "medium" / "high"
+
+# HTTP タイムアウト
+HTTP_TIMEOUT_SEC: float = 1000
+
+# JPEG品質（グリッド画像のエンコード用）
+GRID_JPEG_QUALITY: int  = 85
+
+# 病院ベースレート（事前確率）― 確率較正に使用
+PRIOR_MRS3: float       = 0.794   # mRS ≥ 3
+PRIOR_MRS4: float       = 0.657   # mRS ≥ 4
+PRIOR_MRS5: float       = 0.303   # mRS ≥ 5
+PRIOR_MRS6: float       = 0.137   # mRS = 6（院内死亡）
+
+# 個別スライス画像ディレクトリ
+SLICES_BASE_DIR: str    = r"C:\Users\Owner\Desktop\python\results\ICH_slices_all_mscs"
+
+# グリッド設定
+GRID_COLS: int          = 5
+GRID_ROWS: int          = 5
+LABEL_HEIGHT: int       = 20   # スライス番号ラベルの高さ（px）
+
+# 患者データExcelファイル（D列以降を臨床データとしてプロンプトに統合）
+# 多重補完版では IMPUTED_DATA_PREFIX + i + ".xlsx" を自動解決するため
+# 以下はフォールバック用（補完データが見つからない場合のみ参照）
+PATIENTS_DATA_PATH: str = r"\\FRedirect\desktop$\mk07637\patients data.xlsx"
+# ──────────────────────────────────── #
+
+# --- リトライ対象例外（SDK差分を吸収） ---
+try:
+    from openai import error as _openai_error  # v0系
+    RETRY_ERRORS = (_openai_error.Timeout, _openai_error.APIError, _openai_error.RateLimitError)
+except Exception:
+    try:
+        from openai import APIError, RateLimitError, APITimeoutError  # v1系
+        RETRY_ERRORS = (APITimeoutError, APIError, RateLimitError)
+    except Exception:
+        RETRY_ERRORS = (Exception,)
+
+# --- 認証・ネットワーク ---
+load_dotenv(dotenv_path="E:/UserFiles/naiju/azureOpenAI/.env", override=True)
+api_key    = os.getenv("OPENAI_API_KEY")
+endpoint   = os.getenv("AZURE_OPENAI_ENDPOINT")
+deployment = os.getenv("OPENAI_DEPLOYMENT_NAME", "gpt-5.4")
+if not api_key or not endpoint:
+    raise RuntimeError("❌ OPENAI_API_KEY / AZURE_OPENAI_ENDPOINT が未設定です。")
+
+os.environ.setdefault("HTTP_PROXY",  os.getenv("HTTP_PROXY",  "http://localhost:3128"))
+os.environ.setdefault("HTTPS_PROXY", os.getenv("HTTPS_PROXY", "http://localhost:3128"))
+
+try:
+    import h2  # noqa: F401
+    _http2 = True
+except Exception:
+    _http2 = False
+    print("ℹ️ h2 未インストールのため HTTP/1.1 で接続します", file=sys.stderr)
+
+http_client = httpx.Client(
+    verify=False,
+    timeout=HTTP_TIMEOUT_SEC,
+    trust_env=True,
+    http2=_http2,
+    limits=httpx.Limits(max_connections=20, max_keepalive_connections=20),
+)
+
+client = AzureOpenAI(
+    api_key=api_key,
+    base_url=f"{endpoint}/openai/v1/",
+    api_version="preview",
+    http_client=http_client,
+)
+
+# ───────────────── 患者データ（Excel）読み込み・マッチング ───────────────── #
+
+def load_patient_data(path_override: Optional[str] = None) -> Optional[pd.DataFrame]:
+    """
+    patients data Excel を読み込み、列名を正規化して返す。
+    - A列: 患者番号（整数）→ id7（7桁ゼロパディング文字列）を追加
+    - B列: 入院日（datetime）
+    - C列: 退院日（datetime）
+    - D列以降: 臨床データ
+    path_override が指定された場合はそちらを優先（多重補完データセット用）。
+    ファイルが存在しない場合は None を返し警告を表示。
+    """
+    path = Path(path_override) if path_override else Path(PATIENTS_DATA_PATH)
+    if not path.exists():
+        # DESKTOP_DIR 直下も試す（同じデスクトップに置いた場合）
+        fallback = DESKTOP_DIR / "patients data.xlsx"
+        if fallback.exists():
+            path = fallback
+        else:
+            print(f"⚠️ patients data ファイルが見つかりません: {path}\n"
+                  "   臨床データなしで画像のみで推論します。", file=sys.stderr)
+            return None
+    try:
+        df = pd.read_excel(path, header=0)
+        # A/B/C列を固定名で参照できるよう内部列名を付ける
+        cols = list(df.columns)
+        df.rename(columns={
+            cols[0]: "_患者番号",
+            cols[1]: "_入院日",
+            cols[2]: "_退院日",
+        }, inplace=True)
+        df["_患者番号"] = pd.to_numeric(df["_患者番号"], errors="coerce")
+        df["_入院日"]   = pd.to_datetime(df["_入院日"],   errors="coerce")
+        df["_退院日"]   = pd.to_datetime(df["_退院日"],   errors="coerce")
+        # 7桁ゼロパディングIDを事前計算
+        df["_id7"] = df["_患者番号"].apply(
+            lambda x: str(int(x)).zfill(7) if pd.notna(x) else ""
+        )
+        print(f"📋 {path.name} 読み込み完了: {len(df)} 行, {len(df.columns)} 列")
+        return df
+    except Exception as e:
+        print(f"⚠️ {path.name} の読み込みに失敗しました: {e}\n"
+              "   臨床データなしで画像のみで推論します。", file=sys.stderr)
+        return None
+
+
+def parse_folder_name(folder_name: str) -> Tuple[str, Optional[datetime]]:
+    """
+    フォルダ名から（7桁ゼロパディング患者ID, CT撮影日）を返す。
+    - 単回入院: "0038605"       → ("0038605", None)
+    - 複数入院: "1970525_20240918" → ("1970525", datetime(2024,9,18))
+    桁数が7未満の場合は左ゼロ埋めする。
+    """
+    m = re.fullmatch(r"(\d+)(?:_(\d{8}))?", folder_name)
+    if not m:
+        return folder_name, None
+    pid_str  = m.group(1).zfill(7)
+    date_str = m.group(2)
+    ct_date  = datetime.strptime(date_str, "%Y%m%d") if date_str else None
+    return pid_str, ct_date
+
+
+def find_patient_row(
+    patient_df: Optional[pd.DataFrame],
+    pid_str: str,
+    ct_date: Optional[datetime],
+) -> Optional[pd.Series]:
+    """
+    patients data.xlsx の中から該当行を1行返す。
+    - ct_date が None（単回入院）: 患者番号が一致する行
+    - ct_date あり（複数入院）  : 患者番号が一致し、入院日 ≦ ct_date ≦ 退院日 となる行
+    複数ヒットした場合は先頭行を使用。見つからない場合は None。
+    """
+    if patient_df is None:
+        return None
+    matched = patient_df[patient_df["_id7"] == pid_str]
+    if matched.empty:
+        return None
+    if ct_date is None:
+        return matched.iloc[0]
+    # 入院日〜退院日の範囲内にCT撮影日が含まれる行を探す
+    ct_ts = pd.Timestamp(ct_date)
+    in_range = matched[
+        (matched["_入院日"].notna()) & (matched["_退院日"].notna()) &
+        (matched["_入院日"] <= ct_ts) & (ct_ts <= matched["_退院日"])
+    ]
+    if not in_range.empty:
+        return in_range.iloc[0]
+    # 範囲ヒットなし → 日付が最も近い行にフォールバック
+    diffs = (matched["_入院日"] - ct_ts).abs()
+    return matched.loc[diffs.idxmin()]
+
+
+def format_clinical_data(row: Optional[pd.Series]) -> str:
+    """
+    患者の臨床データ（D列以降）をプロンプト用Markdownテーブルに整形する。
+    内部管理列（_で始まる列）は除外する。
+    """
+    if row is None:
+        return ""
+    lines = ["| Variable | Value |", "|----------|-------|"]
+    for col, val in row.items():
+        col_str = str(col)
+        if col_str.startswith("_"):
+            continue
+        val_str = "" if pd.isna(val) else str(val)
+        lines.append(f"| {col_str} | {val_str} |")
+    return "\n".join(lines)
+
+
+# ───────────────── スライス画像読み込み・グリッド合成 ───────────────── #
+
+def list_patient_ids_from_dir() -> List[str]:
+    """スライスディレクトリ内の患者IDフォルダをソートして返す"""
+    base = Path(SLICES_BASE_DIR)
+    if not base.exists():
+        raise FileNotFoundError(f"スライスディレクトリが見つかりません: {base}")
+    ids = sorted(
+        d.name for d in base.iterdir()
+        if d.is_dir() and any(d.glob("*.jpg"))
+    )
+    return ids
+
+
+def _get_font(size: int):
+    """ラベル用フォントを取得（システムフォントにフォールバック）"""
+    for name in ("arial.ttf", "Arial.ttf", "DejaVuSans.ttf"):
+        try:
+            return ImageFont.truetype(name, size)
+        except OSError:
+            continue
+    return ImageFont.load_default()
+
+
+def build_grid_image(patient_id: str) -> Optional[bytes]:
+    """
+    患者IDフォルダ内のバラ画像を読み込み、
+    5×5グリッド（スライス番号ラベル付き）のJPEGバイトを返す。
+    """
+    folder = Path(SLICES_BASE_DIR) / patient_id
+    if not folder.exists():
+        print(f"⚠️  {patient_id}: フォルダがありません ({folder})", file=sys.stderr)
+        return None
+
+    # スライス番号順にソート
+    slice_files = sorted(
+        folder.glob("*.jpg"),
+        key=lambda p: int(p.stem) if p.stem.isdigit() else 0,
+    )
+    if not slice_files:
+        print(f"⚠️  {patient_id}: スライス画像がありません", file=sys.stderr)
+        return None
+
+    # 1枚目からセルサイズを決定
+    sample = Image.open(slice_files[0])
+    cell_w, cell_h = sample.size
+    sample.close()
+
+    total_slots = GRID_COLS * GRID_ROWS
+    font = _get_font(max(12, LABEL_HEIGHT - 4))
+
+    grid_w = cell_w * GRID_COLS
+    grid_h = (cell_h + LABEL_HEIGHT) * GRID_ROWS
+    grid_img = Image.new("RGB", (grid_w, grid_h), color=(0, 0, 0))
+    draw = ImageDraw.Draw(grid_img)
+
+    for idx, fpath in enumerate(slice_files[:total_slots]):
+        row, col = divmod(idx, GRID_COLS)
+        x = col * cell_w
+        y = row * (cell_h + LABEL_HEIGHT)
+
+        # スライス番号ラベル（白背景＋黒文字）
+        label = f"Slice {fpath.stem}"
+        draw.rectangle([x, y, x + cell_w, y + LABEL_HEIGHT], fill=(255, 255, 255))
+        draw.text((x + 4, y + 1), label, fill=(0, 0, 0), font=font)
+
+        # スライス画像を貼り付け
+        img = Image.open(fpath).convert("RGB").resize((cell_w, cell_h))
+        grid_img.paste(img, (x, y + LABEL_HEIGHT))
+        img.close()
+
+    buf = io.BytesIO()
+    grid_img.save(buf, format="JPEG", quality=GRID_JPEG_QUALITY)
+    return buf.getvalue()
+
+
+def grid_to_data_url(grid_bytes: bytes) -> str:
+    return f"data:image/jpeg;base64,{base64.b64encode(grid_bytes).decode('ascii')}"
+
+# ───────────────── プロンプト構築 ───────────────── #
+
+def build_user_content(
+    grid_data_url: str,
+    clinical_data: str = "",
+) -> List[Dict]:
+    """
+    mRS予測専用プロンプト（マルチモーダル版）。
+    CT画像グリッド + 臨床データテーブルを統合し、
+    Step1: CT所見 → Step2a: 複合リスク統合 → Step2b: 重症度スコア → Step2c: 較正確率
+    の順で推論させる。
+    clinical_data: format_clinical_data() で生成したMarkdownテーブル（空文字列の場合は省略）
+    """
+
+    # 臨床データセクション（データがある場合のみ挿入）
+    if clinical_data.strip():
+        clinical_section = f"""\
+### Clinical Data at Admission
+
+The table below lists clinical variables recorded at admission. \
+These data complement — but do not override — the CT imaging findings. \
+CT-derived and clinical factors carry **equal weight** in the outcome estimation; \
+neither modality should dominate the reasoning in Steps 2a–2c.
+
+{clinical_data}
+
+---
+
+"""
+    else:
+        clinical_section = ""
+
+    prompt = f"""\
+## Non-contrast Head CT — ICH Multimodal Outcome Prediction
+
+The attached image is a **5×5 grid** of non-contrast head CT slices. \
+Each cell is labeled with its slice number (top-left label). \
+Slices are arranged in ascending slice-number order (left-to-right, top-to-bottom). \
+Not all 25 cells may contain a slice — empty (black) cells should be ignored.
+
+**Slice thickness: 5 mm.**  \
+For ABC/2 calculation, count hematoma-containing slices for C \
+(for each slice assign a weight based on hematoma size relative to the largest slice: \
+<25% = 0 (exclude), 25–75% = 0.5 slice, >75% = 1 slice; \
+C = (sum of slice weights) × 5 mm).
+
+---
+
+{clinical_section}\
+### Step 1 — CT Findings
+Systematically describe:
+- **Hematoma location**: lobe/region (e.g., right basal ganglia, left thalamus, lobar, \
+cerebellar, brainstem) and any intraventricular (IVH) or subarachnoid extension.
+- **Hematoma volume (ABC/2)**: identify the slice with the largest hematoma, \
+measure A (longest diameter, mm) and B (perpendicular diameter, mm) on that slice, \
+count hematoma-containing slices for C, compute A × B × C / 2 (mL). Show working.
+- **Mass effect**: midline shift (mm if visible), sulcal effacement, herniation signs.
+- **Other**: perilesional edema, hydrocephalus, prior infarcts, incidental findings.
+
+---
+
+### Step 2a — Compound Risk Integration
+
+List every factor — from **both** the CT findings and the clinical data — \
+that meaningfully shifts prognosis. For each factor state its direction (↑ worse / ↓ better). \
+Treat imaging-derived and clinical factors as **equally weighted sources of evidence**; \
+do not preferentially rely on either modality.
+
+- CT-derived: volume (mL), location (supratentorial deep / lobar / infratentorial / brainstem), \
+IVH presence, herniation signs, midline shift, perilesional edema
+- Clinical: age, preadmission functional status (prestroke mRS), anticoagulation status \
+(INR, VKA, DOAC), admission blood pressure, blood glucose, surgical intervention, \
+relevant lab abnormalities
+
+Then summarise whether the combined profile is **low / moderate / high / very high** risk \
+relative to this institution's ICH cohort.
+
+---
+
+### Step 2b — Overall Severity Judgment
+
+Based on everything identified in Steps 1 and 2a, make an integrated clinical judgment \
+of this patient's overall severity. Do not apply a fixed scoring rubric — instead, \
+reason holistically about how the imaging findings and clinical variables interact:
+
+- Which factors dominate prognosis in this specific patient?
+- Are there synergistic combinations across both modalities \
+  (e.g., large hematoma volume + brainstem location, or IVH + anticoagulation) \
+  that compound risk beyond what any single factor would suggest?
+- Are there any mitigating factors that reduce expected severity?
+- Assign an overall severity category: **low / moderate / high / very high**, \
+  with a one-sentence justification.
+
+---
+
+### Step 2c-i — Unconstrained Raw Estimate
+
+Based **solely** on the CT findings and clinical data for this individual patient — \
+without reference to any population statistics — form your raw clinical judgment \
+of how this patient compares to a **typical** ICH patient. \
+Internally note whether this patient is below average, average, or above average risk \
+for each outcome. Do **not** output these raw judgments yet.
+
+---
+
+### Step 2c-ii — Base-Rate Anchored Calibration
+
+The table below lists this institution's empirical outcome prevalences, \
+derived from clinical records independent of any AI prediction.
+
+| Outcome | Institutional prevalence |
+|---------|--------------------------|
+| mRS ≥ 3 at discharge        | **79.4 %** |
+| mRS ≥ 4 at discharge        | **65.7 %** |
+| mRS ≥ 5 at discharge        | **30.3 %** |
+| mRS = 6 (worst discharge outcome) | **13.7 %** |
+
+These prevalences are the **sole calibration reference**. Use them as follows:
+
+- A patient judged **average risk** in Step 2c-i → output equals the prevalence above.
+- A patient judged **below average** → output is proportionally lower than the prevalence.
+- A patient judged **above average** → output is proportionally higher than the prevalence.
+- The degree of deviation should reflect how far this patient's profile is from \
+  the typical ICH patient at this institution.
+
+**Do not anchor your final value directly to the prevalence number. \
+The prevalence defines the midpoint of the scale, not a default answer.**
+
+**mRS=6 calibration reference (external validation)**: \
+A deep-learning model validated in an independent Japanese ICH cohort (n=175, \
+published in JAHA) and confirmed to be well-calibrated produced the following \
+predicted probability distributions for in-hospital death (mRS=6):
+
+A well-calibrated model assigned the following mRS=6 probabilities \
+for patients who actually died in hospital (n=24): \
+median 0.80, IQR 0.66–0.88, range 0.08–0.91. \
+If you judge this patient likely to die, your mRS=6 probability should be \
+substantially above the base rate (0.137), typically in the range 0.50–0.90. \
+Do not default to values near the base rate for high or very-high-risk patients.
+
+**Hard constraints:**
+- Logical ordering must hold: P(mRS≥3) ≥ P(mRS≥4) ≥ P(mRS≥5) ≥ P(mRS=6).
+- Each value must be between 0.00 and 1.00 (two decimal places).
+
+---
+
+### Required Output Format
+Return your answer in **exactly** the following format (no extra text between the tags):
+
+[CT_FINDINGS]
+<hematoma location, ABC/2 volume with working, mass effect, IVH>
+[/CT_FINDINGS]
+
+[SEVERITY]
+<overall severity category (low/moderate/high/very high) and one-sentence justification>
+[/SEVERITY]
+
+[PROBABILITIES]
+```json
+{{
+  "mRS_ge3": <0.00–1.00>,
+  "mRS_ge4": <0.00–1.00>,
+  "mRS_ge5": <0.00–1.00>,
+  "mRS_eq6": <0.00–1.00>
+}}
+```
+[/PROBABILITIES]
+
+[PREDICTED_MRS]
+<single integer 0–6: your best estimate of discharge mRS based on the CT findings, clinical data, and the probabilities above. Output the integer only, no other text.>
+[/PREDICTED_MRS]
+
+[REASONING]
+<3–5 sentences: how CT findings and key clinical variables jointly determined the severity score, \
+what the raw estimates were before calibration, how the logit transform shifted each value, \
+and why the predicted mRS integer is consistent with the final probabilities>
+[/REASONING]
+"""
+    return [
+        {"type": "input_text",  "text": prompt},
+        {"type": "input_image", "image_url": grid_data_url},
+    ]
+
+# ───────────────── レスポンス処理 ───────────────── #
+
+def _extract_text_from_response(resp) -> str:
+    text = getattr(resp, "output_text", None)
+    if text:
+        return text.strip()
+    try:
+        parts = []
+        for item in getattr(resp, "output", []) or []:
+            for c in getattr(item, "content", []) or []:
+                if getattr(c, "type", "") in ("output_text", "text"):
+                    t = getattr(c, "text", "")
+                    if t:
+                        parts.append(t)
+        text = "".join(parts).strip()
+        if text:
+            return text
+    except Exception:
+        pass
+    return ""
+
+def _extract_model_from_response(resp) -> str:
+    for attr in ("model", "deployment", "deployment_id", "model_id"):
+        v = getattr(resp, attr, None)
+        if v:
+            return str(v)
+    try:
+        v = resp.get("model")  # type: ignore[attr-defined]
+        if v:
+            return str(v)
+    except Exception:
+        pass
+    return str(deployment)
+
+def parse_probabilities(text: str) -> Dict[str, Optional[float]]:
+    """
+    GPT出力の [PROBABILITIES] ブロック内のJSONから確率値を抽出する。
+    パース失敗時は None を返す。
+    """
+    result: Dict[str, Optional[float]] = {
+        "prob_mrs_ge3": None,
+        "prob_mrs_ge4": None,
+        "prob_mrs_ge5": None,
+        "prob_mrs_eq6": None,
+    }
+    block = re.search(r"\[PROBABILITIES\](.*?)\[/PROBABILITIES\]", text, re.DOTALL)
+    if not block:
+        return result
+    # コードフェンス(```json ... ```)があれば除去してJSONだけ取り出す
+    body = re.sub(r"```(?:json)?", "", block.group(1)).replace("```", "").strip()
+    try:
+        data = json.loads(body)
+        mapping = {
+            "prob_mrs_ge3": "mRS_ge3",
+            "prob_mrs_ge4": "mRS_ge4",
+            "prob_mrs_ge5": "mRS_ge5",
+            "prob_mrs_eq6": "mRS_eq6",
+        }
+        for key, json_key in mapping.items():
+            if json_key in data:
+                result[key] = round(float(data[json_key]), 4)
+    except (json.JSONDecodeError, ValueError):
+        pass
+    return result
+
+def parse_ct_findings(text: str) -> str:
+    block = re.search(r"\[CT_FINDINGS\](.*?)\[/CT_FINDINGS\]", text, re.DOTALL)
+    return block.group(1).strip() if block else ""
+
+def parse_severity(text: str) -> str:
+    block = re.search(r"\[SEVERITY\](.*?)\[/SEVERITY\]", text, re.DOTALL)
+    return block.group(1).strip() if block else ""
+
+def parse_predicted_mrs(text: str) -> Optional[int]:
+    """[PREDICTED_MRS]タグから退院時mRS推定値（0–6の整数）を抽出する。"""
+    block = re.search(r"\[PREDICTED_MRS\](.*?)\[/PREDICTED_MRS\]", text, re.DOTALL)
+    if not block:
+        return None
+    try:
+        val = int(block.group(1).strip())
+        if 0 <= val <= 6:
+            return val
+    except ValueError:
+        pass
+    return None
+
+def parse_reasoning(text: str) -> str:
+    block = re.search(r"\[REASONING\](.*?)\[/REASONING\]", text, re.DOTALL)
+    return block.group(1).strip() if block else ""
+
+_REFUSAL_PATTERN = re.compile(
+    r"I(?:'m| am) sorry|cannot assist|can't assist|unable to (help|assist|process)|"
+    r"I apologize|not able to (help|assist)",
+    re.IGNORECASE,
+)
+
+def _is_refusal(text: str) -> bool:
+    """コンテンツフィルタ / モデル拒否レスポンスを検出する"""
+    return bool(_REFUSAL_PATTERN.search(text)) or "[PROBABILITIES]" not in text
+
+def _build_fallback_content(grid_data_url: str) -> List[Dict]:
+    """
+    拒否発生時のフォールバックプロンプト。
+    確率推定部を最小限に抑え、専門用語を統計的表現に置き換える。
+    """
+    prompt = """\
+## Head CT — ICH Functional Outcome Estimation
+
+5×5 grid of non-contrast CT slices (labeled with slice numbers), 5 mm thick.
+
+### Task
+1. Describe hematoma location, estimated volume (ABC/2), IVH, mass effect.
+2. Rate overall severity: low / moderate / high / very high.
+3. Estimate discharge functional outcome probabilities (mRS scale, 0=independent, 6=worst):
+
+[PROBABILITIES]
+```json
+{{
+  "mRS_ge3": <0.00-1.00>,
+  "mRS_ge4": <0.00-1.00>,
+  "mRS_ge5": <0.00-1.00>,
+  "mRS_eq6": <0.00-1.00>
+}}
+```
+[/PROBABILITIES]
+
+[CT_FINDINGS]<findings>[/CT_FINDINGS]
+[SEVERITY]<category>[/SEVERITY]
+[REASONING]<2-3 sentences>[/REASONING]
+"""
+    return [
+        {"type": "input_text",  "text": prompt},
+        {"type": "input_image", "image_url": grid_data_url},
+    ]
+
+def responses_once(user_content: List[Dict]) -> Tuple[str, Optional[str], str]:
+    system_instructions = (
+        "You are a radiologist and neurologist reviewing non-contrast head CT images "
+        "for a retrospective clinical research study on intracerebral hemorrhage outcomes. "
+        "The CT image is a 5×5 grid of labeled slices — use the slice numbers to reference specific slices. "
+        "Provide structured imaging analysis and statistical probability estimates "
+        "for functional outcome at hospital discharge using the modified Rankin Scale. "
+        "Follow the output format exactly. "
+        "All reasoning must appear only inside the designated tags. "
+        "Do NOT produce free text outside the tags."
+    )
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            kwargs = dict(
+                model=deployment,
+                instructions=system_instructions,
+                input=[{"role": "user", "content": user_content}],
+                text={"verbosity": "low"},
+            )
+            if STRICT_REASONING:
+                kwargs["reasoning"] = {"effort": REASONING_EFFORT}
+            resp = client.responses.create(**kwargs)
+            text = _extract_text_from_response(resp)
+            used_model = _extract_model_from_response(resp)
+            # 拒否 / 不完全レスポンスを検出してフォールバック content で即リトライ
+            if text and _is_refusal(text) and isinstance(user_content[0].get("text", ""), str):
+                if "fallback" not in user_content[0].get("text", ""):
+                    fb_image = next(
+                        (c["image_url"] for c in user_content if c.get("type") == "input_image"),
+                        None,
+                    )
+                    if fb_image:
+                        fb_content = _build_fallback_content(fb_image)
+                        fb_content[0]["text"] = "fallback\n" + fb_content[0]["text"]
+                        user_content = fb_content
+                        print("   ⚠️  Refusal detected — retrying with fallback prompt",
+                              file=sys.stderr)
+                        continue
+            return (text if text else FALLBACK_TEXT, None, used_model)
+        except RETRY_ERRORS as exc:
+            msg = str(exc)
+            if "not supported" in msg.lower() or "unknown parameter" in msg.lower():
+                return (FALLBACK_TEXT,
+                        f"request failed (reasoning/verbosity unsupported): {msg}",
+                        str(deployment))
+            if attempt == MAX_RETRIES:
+                return (FALLBACK_TEXT, f"request failed after retries: {msg}", str(deployment))
+            # 429 / no_capacity は長い指数バックオフ
+            is_rate_limit = (
+                "429" in msg or "no_capacity" in msg.lower()
+                or "too_many_requests" in msg.lower() or "rate limit" in msg.lower()
+            )
+            if is_rate_limit:
+                wait = RATE_LIMIT_WAIT_SEC * (2 ** (attempt - 1))  # 60, 120, 240, ...
+                print(f"   ⚠️ 429/no_capacity (attempt {attempt}/{MAX_RETRIES}): "
+                      f"{wait}秒待機してリトライします…", file=sys.stderr)
+            else:
+                wait = WAIT_SEC * attempt
+            time.sleep(wait)
+        except Exception as exc:
+            return (FALLBACK_TEXT, f"unexpected error: {exc}", str(deployment))
+
+# ───────────────── 保存 ───────────────── #
+
+def save_results(results: List[Dict], xlsx_path: Path, csv_path: Path) -> None:
+    if not results:
+        print("⚠️ 保存対象が空のためスキップ", file=sys.stderr)
+        return
+    df = pd.DataFrame(results)
+    with pd.ExcelWriter(xlsx_path, engine="xlsxwriter") as w:
+        df.to_excel(w, index=False, sheet_name="results")
+    print(f"✅ Results saved (xlsx): {xlsx_path}")
+    df.to_csv(csv_path, index=False, encoding="utf-8-sig", quoting=csv.QUOTE_ALL)
+    print(f"✅ Results saved (csv):  {csv_path}")
+
+# ─────────────────── メイン ─────────────────── #
+
+def run_inference_for_dataset(
+    imp_idx: int,
+    patient_df: Optional[pd.DataFrame],
+    folder_names: List[str],
+) -> List[Dict]:
+    """
+    1つの補完データセット（imp_idx: 1〜N_IMPUTATIONS）に対して
+    全患者フォルダを推論し、結果リストを返す。
+    """
+    results: List[Dict] = []
+    for i, folder in enumerate(folder_names, 1):
+        # フォルダ名から患者IDとCT撮影日を解析
+        pid_str, ct_date = parse_folder_name(folder)
+
+        # Excelから該当行を取得し、臨床データを整形
+        patient_row   = find_patient_row(patient_df, pid_str, ct_date)
+        clinical_data = format_clinical_data(patient_row)
+
+        if patient_row is not None:
+            matched_label = (
+                f"入院日={patient_row['_入院日'].date() if pd.notna(patient_row['_入院日']) else 'N/A'}"
+            )
+            print(f"   📋 Excel matched: 患者番号={pid_str}  {matched_label}")
+        else:
+            print(f"   ⚠️  Excel unmatched: folder={folder}", file=sys.stderr)
+
+        grid_bytes = build_grid_image(folder)
+
+        if grid_bytes is None:
+            print(f"⚠️  [{i}/{len(folder_names)}] {folder}: 画像なし → スキップ", file=sys.stderr)
+            results.append({
+                "imputation_index": imp_idx,
+                "folder": folder, "patient_id": pid_str,
+                "ct_date": ct_date.strftime("%Y-%m-%d") if ct_date else "",
+                "excel_matched": patient_row is not None,
+                "ct_findings": "", "severity": "", "reasoning": "",
+                "prob_mrs_ge3": None, "prob_mrs_ge4": None,
+                "prob_mrs_ge5": None, "prob_mrs_eq6": None,
+                "predicted_mrs": None,
+                "raw_response": "SKIPPED (no slice images found)",
+                "model_used": str(deployment),
+                "reasoning_effort": REASONING_EFFORT, "error": ""
+            })
+            continue
+
+        grid_url     = grid_to_data_url(grid_bytes)
+        user_content = build_user_content(grid_url, clinical_data)
+        print(f"[imp{imp_idx}][{i}/{len(folder_names)}] querying… folder={folder}"
+              f"  clinical={'yes' if clinical_data else 'no'}")
+
+        # 確率が4つ全て揃うまでリトライ（欠損なし保証）
+        _PROB_KEYS = ("prob_mrs_ge3", "prob_mrs_ge4", "prob_mrs_ge5", "prob_mrs_eq6")
+        ans, err, used_model = FALLBACK_TEXT, "", str(deployment)
+        probs: Dict[str, Optional[float]] = {k: None for k in _PROB_KEYS}
+        for _prob_attempt in range(1, MAX_PROB_RETRIES + 1):
+            ans, err, used_model = responses_once(user_content)
+            probs = parse_probabilities(ans)
+            if all(probs[k] is not None for k in _PROB_KEYS):
+                break
+            missing = [k for k in _PROB_KEYS if probs[k] is None]
+            print(f"   ⚠️ 確率欠損 (attempt {_prob_attempt}/{MAX_PROB_RETRIES})"
+                  f"  missing={missing} → リトライ", file=sys.stderr)
+            time.sleep(WAIT_SEC)
+        else:
+            print(f"   ❌ {folder}: {MAX_PROB_RETRIES}回リトライ後も確率欠損。最終値で保存します。",
+                  file=sys.stderr)
+
+        print(f"   ↳ model: {used_model}")
+
+        ct_findings   = parse_ct_findings(ans)
+        severity      = parse_severity(ans)
+        predicted_mrs = parse_predicted_mrs(ans)
+        reasoning     = parse_reasoning(ans)
+
+        results.append({
+            "imputation_index": imp_idx,
+            "folder":         folder,
+            "patient_id":     pid_str,
+            "ct_date":        ct_date.strftime("%Y-%m-%d") if ct_date else "",
+            "excel_matched":  patient_row is not None,
+            "ct_findings":    ct_findings,
+            "severity":       severity,
+            "prob_mrs_ge3":   probs["prob_mrs_ge3"],
+            "prob_mrs_ge4":   probs["prob_mrs_ge4"],
+            "prob_mrs_ge5":   probs["prob_mrs_ge5"],
+            "prob_mrs_eq6":   probs["prob_mrs_eq6"],
+            "predicted_mrs":  predicted_mrs,
+            "reasoning":      reasoning,
+            "raw_response":   ans,
+            "model_used":     used_model,
+            "reasoning_effort": REASONING_EFFORT,
+            "error":          err or ""
+        })
+    return results
+
+
+def main() -> None:
+    folder_names = list_patient_ids_from_dir()
+
+    print(f"🤖 Model (Azure deployment): {deployment}")
+    print(f"🌐 Endpoint: {endpoint}")
+    print(f"🖼  Image source: {SLICES_BASE_DIR}")
+    print(f"👥 Folders found: {len(folder_names)}")
+    print(f"🔁 Imputation sets: {N_IMPUTATIONS}")
+
+    for imp_idx in range(1, N_IMPUTATIONS + 1):
+        # ─── 補完データセットのパスを解決 ───────────────────────────── #
+        imp_path = DESKTOP_DIR / f"{IMPUTED_DATA_PREFIX}{imp_idx}.xlsx"
+        print(f"\n{'='*60}")
+        print(f"📂 Imputation {imp_idx}/{N_IMPUTATIONS}: {imp_path}")
+        print(f"{'='*60}")
+
+        patient_df = load_patient_data(str(imp_path))
+
+        # ─── 推論実行 ────────────────────────────────────────────────── #
+        results: List[Dict] = []
+        try:
+            results = run_inference_for_dataset(imp_idx, patient_df, folder_names)
+        finally:
+            # imputation ごとに独立したファイルへ保存
+            out_xlsx = DESKTOP_DIR / f"{OUTPUT_FILE_PREFIX}{imp_idx}.xlsx"
+            out_csv  = DESKTOP_DIR / f"{OUTPUT_FILE_PREFIX}{imp_idx}.csv"
+            print(f"💾 Saving imp{imp_idx} → {out_xlsx}")
+            save_results(results, out_xlsx, out_csv)
+
+    print("\n🎉 All done!  ich_mrs_results_imp1〜5.xlsx/csv を保存しました。")
+
+if __name__ == "__main__":
+    main()
